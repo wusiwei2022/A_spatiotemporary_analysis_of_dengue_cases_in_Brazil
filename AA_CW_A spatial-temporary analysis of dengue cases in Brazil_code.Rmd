@@ -1,0 +1,347 @@
+---
+title: "Project Title"
+author: "By 02360909 (i.e. your ID)"
+date: "31/03/2023"
+
+header-includes:
+    - \usepackage{bm}
+output:
+  html_document:
+    toc: true
+    toc_float: true
+bibliography: biblio.bib
+---
+  
+\pagenumbering{gobble} 
+\pagenumbering{arabic} 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message=FALSE, warning=FALSE, fig.align = "center", class.source='klippy')
+```
+
+```{r klippy, include=FALSE}
+klippy::klippy(position = c('top', 'right'),color = 'darkred',
+               tooltip_message = 'Click to copy', tooltip_success = 'Done')
+```
+
+
+# Supplementary material
+## 1. library packages and read in data
+```{r}
+rm(list=ls())
+path = dirname(rstudioapi::getActiveDocumentContext()$path)
+setwd(path)
+rm(path)
+
+# Load the libraries you will use for the mini-project report
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(INLA)
+library(sf)
+library(SpatialEpi)
+library(RColorBrewer)
+library(tidyverse)
+library(spdep)
+library(patchwork)
+```
+
+```{r results='hide'}
+dengue = read.csv("DATA_SCIENTIFIC_PROJECTS/DS2_DengueBrazil/data_2015_2019.csv")
+brazil = st_read("DATA_SCIENTIFIC_PROJECTS/DS2_DengueBrazil/shape_brazil.shp")
+```
+
+
+## 2. Pre-processing and explore data
+Dengue data
+```{r}
+## For absence of age and sex of each micro-region, the number of expected cases is not available.
+## Therefore, we only include an offset based on the population into the inla() function
+dengue = dengue %>% mutate(pop_100k = population/100000) # transformation: the response is equivalent to an incidence rate per 100,100 people(specify into the INLA: offset=log(E))
+# dengue$month = factor(dengue$month)
+# dengue$year = factor(dengue$year)
+
+dengue = dengue %>% mutate(pdsi = cut(pdsi, breaks=c(-10,-4,-3,-2,2,3,4,10), include.lowest = FALSE, labels=c("Extreme Drought", "Severe Drought", "Moderate Drought", "Near Normal", "Unusual Moist", "Very Moist", "Extremely Moist"))) %>% mutate(pdsi = factor(pdsi, levels=c("Near Normal","Moderate Drought","Severe Drought","Extreme Drought","Unusual Moist","Very Moist","Extremely Moist")))
+```
+
+Polygon data
+```{r}
+## Remove island FERNANDO DE NORONHA with micro-region code 26019, whose PDSI was missing
+brazil = brazil %>% filter(code != 26019)
+
+## Join the Brazil and dengue
+dengue_brazil = left_join(brazil, dengue, by="code")
+# class(dengue_brazil)
+```
+
+Prepare the adjacency matrix
+```{r}
+brazil_nb = poly2nb(brazil)
+nb2INLA("brazil_adj", brazil_nb) # make the neighbor matrix compatible with INLA format by creating map_adj with nb2INLA
+brazil_adj = inla.read.graph(filename="brazil_adj")
+```
+
+## 3. Descriptive analysis
+```{r}
+## Visualize rate of dengue by month and year: show seasonal pattern(high rate in 1st half of a year) 
+Fig1_descri_tm = dengue_brazil %>% 
+  group_by(year, month) %>% 
+  summarise(dengue_cases = sum(dengue_cases), pop_100k = sum(pop_100k)) %>%
+  mutate(dengue_rate=(dengue_cases/pop_100k)) %>% 
+  ggplot(aes(x=factor(month), y=dengue_rate, group=factor(year) ,color=factor(year)))+
+  geom_line()+
+  theme_classic()+
+  labs(color ="Year", x="Month", y="Incidence rate of dengue", title = "Temporal pattern of dengue rate")+
+  theme(plot.title = element_text(hjust=0.5, size = 10, face = "bold"))
+
+## Visualize rate of dengue by region
+Fig2_descri_sp = dengue_brazil %>% 
+  group_by(code, geometry) %>%
+  summarise(dengue_cases = mean(dengue_cases), pop_100k = mean(pop_100k)) %>%
+  mutate(dengue_rate = dengue_cases/pop_100k) %>%
+  ggplot()+
+  geom_sf(aes(fill=dengue_rate))+
+  theme_bw()+
+  scale_fill_viridis_c(direction = -1)+
+  labs(fill = "Incidence rate of dengue", title = "Annual average incidence rate of dengue(2015 - 2019)")+
+  theme(plot.title = element_text(hjust = 0.5, size = 10, face = "bold"), axis.text = element_blank())
+```
+
+```{r eval=TRUE, echo=FALSE, fig.cap="Fig1.Temporal pattern of dengue rate"}
+Fig1_descri_tm
+```
+
+```{r eval=TRUE, echo=FALSE, fig.cap="Fig2.Spatial pattern of dengue rate"}
+Fig2_descri_sp
+```
+
+
+## 4. spatial(BYM2) - Temporal(RW1)  model
+Run time - spatial model
+```{r}
+formula_stBYM =  dengue_cases ~ 
+  tmin + pdsi + water_network +
+  f(ID_space, model="bym2", graph=brazil_adj,
+    hyper=list(prec = list(prior = "pc.prec",param = c(0.5 / 0.31, 0.01)),
+               phi = list(prior = "pc", param = c(0.5, 2 / 3)))) + 
+  f(ID_time, model="rw1", hyper=list(prec = list(prior = "pc.prec", param = c(0.5 / 0.31, 0.01))))
+                            
+stBYM.model = inla(formula=formula_stBYM, family="poisson", offset = log(pop_100k), data=dengue_brazil, control.compute=list(dic=TRUE, waic=TRUE))
+# summary(stBYM.model)
+```
+
+Create the posterior mean for the spatial and temporal effects
+```{r}
+# Posterior mean(expectancy) of spatial effects 
+RR_stBYM = c()
+
+for(i in 1:(length(stBYM.model$marginals.random$ID_space)/2)){
+  RR_stBYM[i] = inla.emarginal(function(x) exp(x), stBYM.model$marginals.random$ID_space[[i]])
+} # The first half(1:517) is the total spatial effect, the second half(518 - 1114) is the structured spatial effect 
+
+# Posterior probability of spatial log(RR) >= 0
+RR_stBYM_marg = stBYM.model$marginals.random$ID_space[1:(length(stBYM.model$marginals.random$ID_space)/2)]
+PP_stBYM = lapply(RR_stBYM_marg, function(x){1 - inla.pmarginal(0, x)})
+```
+
+```{r}
+# Posterior mean(expectancy), 2.5% quantile and 97.5% quantile of spatial effects
+RR_stRW_RR = c()
+RR_stRW_lo = c()
+RR_stRW_hi = c()
+
+for(i in 1:length(stBYM.model$marginals.random$ID_time)){
+  RR_stRW_RR[i] = inla.emarginal(function(x) exp(x), stBYM.model$marginals.random$ID_time[[i]])
+  RR_stRW_lo[i] = inla.qmarginal(0.025,inla.tmarginal(function(x) exp(x), stBYM.model$marginals.random$ID_time[[i]])) # 2.5% quantile
+  RR_stRW_hi[i] = inla.qmarginal(0.975, inla.tmarginal(function(x) exp(x), stBYM.model$marginals.random$ID_time[[i]])) # 97.5% quantile
+}
+RR_stRM = data.frame(RR=RR_stRW_RR, Low = RR_stRW_lo, High = RR_stRW_hi)
+```
+
+Plot temporal effect
+```{r}
+# Plot temporal effect
+Temp_st = 
+  ggplot(data = RR_stRM, aes(factor(format(seq.Date(from = as.Date("2015-01-01"), length.out = 60, by = "month"), "%B %Y"),levels = c(format(seq.Date(from = as.Date("2015-01-01"), length.out = 60, by = "month"), "%B %Y"))),RR,group=1)) + 
+  geom_line() + geom_point() + theme_bw() + 
+  geom_ribbon(aes(ymin = Low, ymax=High), alpha = 0.2) + 
+  labs(x="Time", y="Rate ratio of dengue", title = "Temporal effect(Spatiotemporal model type I interaction)")+
+  theme(axis.text.x.bottom = element_text(angle=90, size = 5, hjust=1, vjust = 0.5)) 
+```
+
+Plot spatial effect
+```{r}
+# Plot spatial effect
+resRR_pp_st = data.frame(resRR = RR_stBYM, PP = unlist(PP_stBYM), code = brazil$code)
+
+# set break points
+resRR_pp_st$resRRcat = cut(resRR_pp_st$resRR, breaks = c(min(resRR_pp_st$resRR), 0.4, 0.6, 0.8, 1, 1.2, 1.4, 1.6, max(resRR_pp_st$resRR)), include.lowest = T)
+resRR_pp_st$PPcat = cut(resRR_pp_st$PP, c(0, 0.2, 0.8, 1.00), include.lowest = TRUE)
+map_RR_ST= left_join(brazil, resRR_pp_st, by =c("code" = "code"))
+```
+
+```{r results='hide'}
+plot_st_res = ggplot() + geom_sf(data = map_RR_ST, aes(fill = resRR)) + 
+  theme_bw()+ scale_fill_viridis_c()+
+  labs(title = "Spatial RR (Spatiotemporal no interaction)")+
+  theme( axis.text.x = element_blank(), axis.text.y = element_blank(), plot.title = element_text(size = 12, face = "bold"), legend.position = "bottom")
+
+plot_st_pp = ggplot() + geom_sf(data = map_RR_ST, aes(fill = PP)) + 
+  theme_bw() +scale_fill_viridis_c()+
+  labs(title = "Spatial PP (Spatiotemporal no interaction)")+
+  theme(axis.text.x = element_blank(), axis.text.y = element_blank(), plot.title = element_text(size= 12, face = "bold"), legend.position = "bottom")
+```
+
+```{r}
+plot_st_res # Spatial residual rate (Spatiotemporal no interaction)
+plot_st_pp # Probability of spatial residual rate > 1 (Spatiotemporal no interaction)
+```
+
+## Time(RW1) - spatial(BYM2) model with time-spatial interaction(type one)
+
+Fit time-spatial model
+```{r}
+# Fit spatiotemporal model with type I interaction
+dengue_brazil$ID_space_time = seq(1, dim(dengue_brazil)[1])
+
+formula_ST_intI = dengue_cases ~ tmin + pdsi + water_network +
+  f(ID_space, model = "bym2", graph = brazil_adj,
+    hyper = list(prec = list(prior = "pc.prec", param = c(0.5/0.31, 0.01)),
+                 phi = list(prior = "pc", param = c(0.5, 2/3)))) +
+  f(ID_time, model = "rw1", hyper = list(prec=list(prior = "pc.prec", param = c(0.5/0.31, 0.01))))+
+  f(ID_space_time, model = "iid", hyper=list(prec=list(prior = "pc.prec", param = c(0.5/0.31, 0.01))))
+
+stIntI.BYM.model = inla(formula = formula_ST_intI, family = "poisson", data = dengue_brazil, offset = log(pop_100k), control.compute = list(dic=TRUE, waic=TRUE))
+```
+
+Create the posterior mean for the spatial and temporal effects and compare with the ST model results without interaction Spatial effect
+```{r}
+# Spatial relative risks
+RR_stIntI.BYM = c()
+
+for(i in 1: dim(brazil)[1]){
+  RR_stIntI.BYM[i] = inla.emarginal(function(x) exp(x), stIntI.BYM.model$marginals.random$ID_space[[i]])
+}
+
+#Posterior probabilities (for spatial RR): P(spatial RR >= 1(log(spatial RR) >= 0))
+RR_stIntI.BYM_marg = stIntI.BYM.model$marginals.random$ID_space[1:(dim(brazil)[1])]
+PP_stIntI.BYM = lapply(RR_stIntI.BYM_marg, function(x){1 - inla.pmarginal(0,x)})
+
+```
+
+Temporal effect
+```{r}
+# Temporal effect
+RR_stIntI.RW_RR = c()
+RR_stIntI.RW_lo = c()
+RR_stIntI.RW_hi = c()
+
+for( i in (1:length(stIntI.BYM.model$marginals.random$ID_time))){
+  RR_stIntI.RW_RR[i] = inla.emarginal(function(x) exp(x), stIntI.BYM.model$marginals.random$ID_time[[i]]) # posterior mean
+  RR_stIntI.RW_lo[i] = inla.qmarginal(0.025, inla.tmarginal(function(x) exp(x), stIntI.BYM.model$marginals.random$ID_time[[i]])) # 2.5% percentile
+  RR_stIntI.RW_hi[i] = inla.qmarginal(0.975, inla.tmarginal(function(x) exp(x), stIntI.BYM.model$marginals.random$ID_time[[i]])) # 97.5% percentile
+}
+
+RR_stIntI.RW = data.frame(RR=RR_stIntI.RW_RR, Low = RR_stIntI.RW_lo, High = RR_stIntI.RW_hi)
+```
+
+```{r}
+# Plot temporal effect
+Temp_stIntI = ggplot(data = RR_stIntI.RW, aes(factor(format(seq.Date(from = as.Date("2015-01-01"), length.out = 60, by = "month"), "%B %Y"),levels = c(format(seq.Date(from = as.Date("2015-01-01"), length.out = 60, by = "month"), "%B %Y"))),RR,group=1)) + 
+  geom_line() + geom_point() + theme_classic() + 
+  geom_ribbon(aes(ymin = Low, ymax=High), alpha = 0.2) + labs(x="Time", y="Rate ratio of dengue")+
+  theme(axis.text.x.bottom = element_text(angle=90, size = 5, hjust=1, vjust = 0.5)) 
+```
+
+Map spatial residual RRs
+```{r}
+# Map spatial residual RRs
+resRR_PP_stIntI = data.frame(resRR = RR_stIntI.BYM, PP=unlist(PP_stIntI.BYM), code = brazil$code)
+
+# break points
+resRR_PP_stIntI$resRR_cat = cut(resRR_PP_stIntI$resRR, breaks = c(min(resRR_PP_stIntI$resRR), 0.4 ,0.6, 0.8, 1, 1.2, 1.4, 1.6, max(resRR_PP_stIntI$resRR)), include.lowest = TRUE)
+resRR_PP_stIntI$PP_cat = cut(resRR_PP_stIntI$PP, breaks = c(0, 0.2, 0.4, 0.6, 0.8, 1), include.lowest = TRUE)
+map_RR_ST.IntI = left_join(brazil, resRR_PP_stIntI, by = c("code" = "code"))
+
+```
+
+```{r}
+plot_stIntI_res = ggplot() + geom_sf(data = map_RR_ST.IntI, aes(fill = resRR)) + 
+  theme_bw() + scale_fill_viridis_c() + 
+  labs(title = "Spatial RR (Spatiotemporal type I interaction)")+
+  theme(axis.text.x = element_blank(), 
+        axis.text.y = element_blank(),
+        plot.title = element_text(size = 12, face = "bold"),
+        legend.position = "bottom")
+
+plot_stIntI_pp = ggplot() + geom_sf(data = map_RR_ST.IntI, aes(fill = PP)) + 
+  theme_bw() + scale_fill_viridis_c() + 
+  labs(title = "Spatial PP (Spatiotemporal type I interaction)") + 
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        plot.title = element_text(size = 12, face = "bold"),
+        legend.position = "bottom")
+
+plot_stIntI_res | plot_stIntI_pp 
+```
+
+## Get a table of parameters and hyper-parameters
+```{r}
+# # fixed effect of spatial temporal model
+# stBYM.model$summary.fixed
+# stBYM.model$summary.random$ID_space
+# stBYM.model$summary.random$ID_time
+# 
+# # fixed effect of spatial temporal with type 1 interaction model
+# stIntI.BYM.model$summary.fixed
+# stIntI.BYM.model$summary.random$ID_space
+# stIntI.BYM.model$summary.random$ID_time
+```
+
+## Compare AIC and WAIC across different models
+```{r}
+dat.WAIC = data.frame(model = c("SpatTemp no int", "SpatTemp type1"),
+                      WAIC = round(c(stBYM.model$waic$waic, stIntI.BYM.model$waic$waic)))
+```
+
+## Plot table and plots
+Table for Fixed effects
+```{r}
+fixed_effects_stBYM = cbind(exp(stBYM.model$summary.fixed$mean), exp(stBYM.model$summary.fixed$`0.025quant`), exp(stBYM.model$summary.fixed$`0.975quant`)) 
+fixed_effects_stIntI.BYM = cbind(exp(stIntI.BYM.model$summary.fixed$mean), exp(stIntI.BYM.model$summary.fixed$`0.025quant`), exp(stIntI.BYM.model$summary.fixed$`0.975quant`))
+
+fixed_effects = round(cbind(fixed_effects_stBYM, fixed_effects_stIntI.BYM),2)
+colnames(fixed_effects) = c("Mean", "2.5% quantile", "97.5% quantile")
+rownames(fixed_effects) = c("Intercept (No interaction)", "tmin (No interaction)", "pdsi (no interaction)", "water network (no interaction)",
+         "Intercept (Type I interaction)", "tmin (No interaction)", "pdsi (Type I interaction)", "water network (Type I interaction)")
+```
+
+```{r}
+knitr::kable(
+  fixed_effects,
+  caption = "Table1. Rate ratio of fixed effects(tmin, pds0.95 i, and water network) of Spatial Temporal model", 
+  booktabs = TRUE)%>%
+  kable_styling(bootstrap_options = "striped", full_width = TRUE ,position = "center")
+```
+
+```{r}
+# dengue_brazil_test = dengue_brazil %>% mutate(pdsi_cat = cut(pdsi, breaks=c(min(dengue_brazil$pdsi), quantile(dengue_brazil$pdsi, 0.25), quantile(dengue_brazil$pdsi, 0.5), quantile(dengue_brazil$pdsi, 0.75),max(dengue_brazil$pdsi)), include.lowest = TRUE, labels=c("Q25", "Q50", "Q75", "Q100"))) %>% mutate(pdsi_cat = factor(pdsi_cat, levels=c("Q25", "Q50", "Q75", "Q100")))
+
+dengue_brazil = dengue_brazil %>% mutate(pdsi_cat = cut(pdsi, breaks=c(-10,-4,-3,-2,2,3,4,10), include.lowest = FALSE, labels=c("Extreme Drought", "Severe Drought", "Moderate Drought", "Near Normal", "Unusual Moist", "Very Moist", "Extremely Moist"))) %>% mutate(pdsi_cat = factor(pdsi_cat, levels=c("Near Normal","Moderate Drought","Severe Drought","Extreme Drought","Unusual Moist","Very Moist","Extremely Moist")))
+
+dengue_brazil_lag$pdsi_cat_lag = lag(dengue_brazil_lag$pdsi_cat, 5)
+
+dengue_brazil_lag = dengue_brazil_lag %>% filter(!(year==2015 & month == 1)) %>% filter(!(year==2015 & month == 2)) %>% filter(!(year==2015 & month == 3))  %>% filter(!(year==2015 & month == 4)) %>% filter(!(year==2015 & month == 5))
+
+
+formula_stBYM_lag =  dengue_cases ~ 
+  tmin + pdsi_cat_lag + water_network +
+  f(ID_space, model="bym2", graph=brazil_adj,
+    hyper=list(prec = list(prior = "pc.prec",param = c(0.5 / 0.31, 0.01)),
+               phi = list(prior = "pc", param = c(0.5, 2 / 3)))) + 
+  f(ID_time, model="rw1", hyper=list(prec = list(prior = "pc.prec", param = c(0.5 / 0.31, 0.01))))
+                            
+stBYM.model_lag = inla(formula=formula_stBYM_lag , family="poisson", offset = log(pop_100k), data=dengue_brazil_lag, control.compute=list(dic=TRUE, waic=TRUE))
+stBYM.model_lag$summary.fixed
+```
+
